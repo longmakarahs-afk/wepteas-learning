@@ -1,0 +1,6 @@
+{
+  "name": "SecureAttend",
+  "description": "SecureAttend - Multi-tenant Smart HR, Attendance & Payroll System in Khmer with AI Face Verification",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
