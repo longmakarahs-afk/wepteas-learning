@@ -2,4 +2,23 @@
 
 @theme {
   --font-sans: var(--font-kantumruy), "Inter", system-ui, sans-serif;
+
+  /* Brand Colors */
+  --color-brand-primary: #4f46e5;       /* Indigo 600 */
+  --color-brand-secondary: #06b6d4;     /* Cyan 500 */
+  --color-brand-accent: #10b981;        /* Emerald 500 */
+  --color-brand-purple: #7c3aed;        /* Violet 600 */
+  --color-brand-dark: #090d16;          /* Deep Space Void */
+
+  /* Gradients */
+  --background-image-brand-gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #06b6d4 100%);
+  --background-image-header-gradient: linear-gradient(to right, #020617 0%, #0f172a 50%, #1e1b4b 100%);
+  --background-image-glow-mesh: radial-gradient(circle, rgba(79, 70, 229, 0.15) 0%, rgba(9, 13, 22, 0) 70%);
+
+  /* Custom Luxury Shadows */
+  --shadow-neon-glow-indigo: 0 0 15px rgba(79, 70, 229, 0.35);
+  --shadow-neon-glow-cyan: 0 0 15px rgba(6, 182, 212, 0.35);
+  --shadow-neon-glow-success: 0 0 15px rgba(16, 185, 129, 0.35);
+  --shadow-inner-soft: inset 0 2px 4px 0 rgba(0, 0, 0, 0.4);
 }
+

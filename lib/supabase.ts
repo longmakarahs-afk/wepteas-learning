@@ -279,12 +279,22 @@ export const forceResetDatabase = () => {
   localStorage.setItem('secureattend_payrolls', JSON.stringify(SEED_PAYROLLS));
 };
 
+export interface FaceEnrollment {
+  id: string;
+  employee_id: string;
+  descriptor: number[];
+  created_at?: string;
+}
+
+const SEED_FACE_ENROLLMENTS: FaceEnrollment[] = [];
+
 export const getDbState = () => {
   const tenants = getStored('tenants', SEED_TENANTS);
   const employees = getStored('employees', SEED_EMPLOYEES);
   const logs = getStored('attendance_logs', SEED_ATTENDANCE);
   const leaves = getStored('leave_requests', SEED_LEAVES);
   const payrolls = getStored('payrolls', SEED_PAYROLLS);
+  const face_enrollments = getStored('face_enrollments', SEED_FACE_ENROLLMENTS);
 
   // Guarantee seed tables are saved in LocalStorage if first time
   if (typeof window !== 'undefined' && !localStorage.getItem('secureattend_tenants')) {
@@ -293,9 +303,10 @@ export const getDbState = () => {
     setStored('attendance_logs', logs);
     setStored('leave_requests', leaves);
     setStored('payrolls', payrolls);
+    setStored('face_enrollments', face_enrollments);
   }
 
-  return { tenants, employees, logs, leaves, payrolls };
+  return { tenants, employees, logs, leaves, payrolls, face_enrollments };
 };
 
 // Database operation wrapper
@@ -601,5 +612,31 @@ export const db = {
     }
     setStored('payrolls', state.payrolls);
     return newPayroll;
+  },
+
+  async addFaceEnrollment(enrollment: Omit<FaceEnrollment, 'id'>): Promise<FaceEnrollment> {
+    const newEnrollment: FaceEnrollment = {
+      ...enrollment,
+      id: crypto.randomUUID(),
+      created_at: new Date().toISOString()
+    };
+    if (supabase) {
+      const { data, error } = await supabase.from('face_enrollments').insert([newEnrollment]).select().single();
+      if (!error && data) return data as FaceEnrollment;
+    }
+    const state = getDbState();
+    // Overwrite existing enrollment for this employee
+    state.face_enrollments = state.face_enrollments.filter(e => e.employee_id !== enrollment.employee_id);
+    state.face_enrollments.push(newEnrollment);
+    setStored('face_enrollments', state.face_enrollments);
+    return newEnrollment;
+  },
+
+  async getFaceEnrollments(): Promise<FaceEnrollment[]> {
+    if (supabase) {
+      const { data, error } = await supabase.from('face_enrollments').select('*');
+      if (!error && data) return data as FaceEnrollment[];
+    }
+    return getDbState().face_enrollments;
   }
 };

@@ -3,6 +3,8 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
+import QRCode from 'qrcode';
+import { Scanner } from '@yudiel/react-qr-scanner';
 import { 
   Building2, School, Users, CheckCircle2, AlertTriangle, Clock, XCircle, 
   MapPin, ScanFace, QrCode, CreditCard, Send, PlusCircle, Trash2, 
@@ -10,7 +12,9 @@ import {
   ChevronRight, Calendar, UserPlus, Fingerprint, Search, ShieldCheck,
   TrendingUp, Award, DollarSign, ArrowUpRight, Check, CheckSquare, MessageSquare, Briefcase
 } from 'lucide-react';
-import { db, Tenant, Employee, AttendanceLog, LeaveRequest, Payroll, forceResetDatabase } from '@/lib/supabase';
+import { db, Tenant, Employee, AttendanceLog, LeaveRequest, Payroll, FaceEnrollment, forceResetDatabase } from '@/lib/supabase';
+
+const getFaceApi = () => typeof window !== 'undefined' ? (window as any).faceapi : null;
 
 export default function SecureAttendPage() {
   // --- DATABASE & TENANT STATE ---
@@ -25,11 +29,14 @@ export default function SecureAttendPage() {
   // Interface toggles and tabs
   const [activeTab, setActiveTab] = useState<'GPS' | 'FACE' | 'QR' | 'NFC'>('GPS');
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [hrActiveTab, setHrActiveTab] = useState<'OVERVIEW' | 'LOGS' | 'LEAVES' | 'PAYROLL'>('OVERVIEW');
+  const [hrActiveTab, setHrActiveTab] = useState<'OVERVIEW' | 'LOGS' | 'LEAVES' | 'PAYROLL' | 'OFFICE_QR'>('OVERVIEW');
   const [employeeSearch, setEmployeeSearch] = useState('');
+  const [officeQrDataUrl, setOfficeQrDataUrl] = useState<string>('');
 
   // --- REGISTRATION / CREATE MODAL STATE ---
   const [showRegModal, setShowRegModal] = useState(false);
+  const [showFaceEnrollModal, setShowFaceEnrollModal] = useState(false);
+  const [faceEnrollStatus, setFaceEnrollStatus] = useState<string | null>(null);
   const [newEmpKh, setNewEmpKh] = useState('');
   const [newEmpEn, setNewEmpEn] = useState('');
   const [newEmpRole, setNewEmpRole] = useState('Staff');
@@ -53,6 +60,8 @@ export default function SecureAttendPage() {
   const [cameraActive, setCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const enrollVideoRef = useRef<HTMLVideoElement | null>(null);
+  const enrollCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [isMatchingFace, setIsMatchingFace] = useState(false);
   const [faceMatchResult, setFaceMatchResult] = useState<{
@@ -60,6 +69,29 @@ export default function SecureAttendPage() {
     score: number;
     notes: string;
   } | null>(null);
+  const [isFaceApiLoaded, setIsFaceApiLoaded] = useState(false);
+
+  useEffect(() => {
+    let checkInterval: NodeJS.Timeout;
+    const loadModels = async () => {
+      try {
+        const faceapi = getFaceApi();
+        if (faceapi) {
+          await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
+          await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
+          await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+          setIsFaceApiLoaded(true);
+        } else {
+          // Poll every 500ms if script hasn't loaded yet
+          checkInterval = setTimeout(loadModels, 500);
+        }
+      } catch (err) {
+        console.error('Failed to load FaceAPI models:', err);
+      }
+    };
+    loadModels();
+    return () => clearTimeout(checkInterval);
+  }, []);
   
   // NFC Key simulation
   const [scannedNfcId, setScannedNfcId] = useState('');
@@ -233,6 +265,72 @@ export default function SecureAttendPage() {
   };
 
   // --- CAMERA HANDLING ---
+  const [enrollCameraActive, setEnrollCameraActive] = useState(false);
+
+  const startEnrollCamera = async () => {
+    setEnrollCameraActive(true);
+    setFaceEnrollStatus(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      if (enrollVideoRef.current) {
+        enrollVideoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error('Enroll Webcam failed/denied.', err);
+    }
+  };
+
+  const stopEnrollCamera = () => {
+    if (enrollVideoRef.current && enrollVideoRef.current.srcObject) {
+      const stream = enrollVideoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach((track) => track.stop());
+      enrollVideoRef.current.srcObject = null;
+    }
+    setEnrollCameraActive(false);
+  };
+
+  const captureAndEnrollFace = async () => {
+    if (!selectedEmployee) return;
+    if (enrollVideoRef.current && enrollCanvasRef.current) {
+      const video = enrollVideoRef.current;
+      const canvas = enrollCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        setFaceEnrollStatus('Computing 128-d descriptor...');
+        // Compute descriptor
+        try {
+          const faceapi = getFaceApi();
+          if (!faceapi) throw new Error("FaceAPI not loaded");
+          const detections = await faceapi.detectSingleFace(canvas).withFaceLandmarks().withFaceDescriptor();
+          if (detections) {
+            const descriptor = Array.from(detections.descriptor) as number[];
+            await db.addFaceEnrollment({
+              employee_id: selectedEmployee.id,
+              descriptor
+            });
+            // Update the photo
+            const dataUrl = canvas.toDataURL('image/jpeg');
+            await db.updateEmployeePhoto(selectedEmployee.id, dataUrl);
+            setFaceEnrollStatus('✅ Registration successful!');
+            setTimeout(() => {
+              stopEnrollCamera();
+              setShowFaceEnrollModal(false);
+            }, 2000);
+          } else {
+            setFaceEnrollStatus('❌ No face detected. Try again.');
+          }
+        } catch (err) {
+          console.error(err);
+          setFaceEnrollStatus('❌ Enrollment failed.');
+        }
+      }
+    }
+  };
+
   const startCamera = async () => {
     setCameraActive(true);
     setCapturedImage(null);
@@ -301,6 +399,15 @@ export default function SecureAttendPage() {
     }
   };
 
+  const [scannedQrSecret, setScannedQrSecret] = useState<string>('');
+  const [isScanningQr, setIsScanningQr] = useState(false);
+  const handleScanQr = (detectedCodes: any[]) => {
+    if (detectedCodes[0] && detectedCodes[0].rawValue) {
+      setScannedQrSecret(detectedCodes[0].rawValue);
+      setIsScanningQr(false);
+    }
+  };
+
   // --- ACTIONS: CHECK IN / OUT ---
   const handleCheckIn = async () => {
     if (!selectedTenant || !selectedEmployee) return;
@@ -323,36 +430,81 @@ export default function SecureAttendPage() {
       notesText = `បានផ្ទៀងផ្ទាត់ GPS៖ ${Math.round(calculatedMeters)}ម៉ែត្រ ពីមជ្ឈមណ្ឌល (${geofenceOk ? 'ដណ្តប់សុវត្ថិភាព' : 'ក្រៅតំបន់'})`;
     }
 
-    // Step 2: AI Face Match (calls Next.js server-side route)
+    // Step 2: AI Face Match
     if (activeTab === 'FACE') {
-      if (!capturedImage) {
+      if (!capturedImage || !canvasRef.current) {
         alert('សូមថតរូបផ្ទៃមុខរបស់អ្នកជាមុនសិន! (Please capture face snapshot first)');
         return;
       }
       setIsMatchingFace(true);
       try {
-        const response = await fetch('/api/attendance/face-match', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            employeeId: selectedEmployee.id,
-            liveImage: capturedImage,
-            registeredImage: selectedEmployee.photo_url || null,
-          }),
-        });
-        const matchData = await response.json();
-        setFaceMatchResult(matchData);
-        photoMatched = matchData.matched;
-        matchingScore = matchData.score;
-        notesText = matchData.notes;
-      } catch (err) {
-        console.error('AI Face Matching service error:', err);
-        photoMatched = true;
-        matchingScore = 91;
-        notesText = 'ការផ្គូផ្គងជីវមាត្រជោគជ័យ (AI Standard Match)';
-      } finally {
+        setFaceMatchResult({ matched: false, score: 0, notes: 'កំពុងទាញយកទិន្នន័យផ្ទៃមុខ... (Extracting...)' });
+        
+        // 1. Get Live descriptor
+        const imgCanvas = document.createElement('canvas');
+        const img = new Image();
+        img.src = capturedImage;
+        await new Promise((resolve) => { img.onload = resolve; });
+        imgCanvas.width = img.width;
+        imgCanvas.height = img.height;
+        const ctx = imgCanvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0);
+
+        const faceapi = getFaceApi();
+        if (!faceapi) throw new Error("FaceAPI not loaded");
+        
+        const detections = await faceapi.detectSingleFace(imgCanvas).withFaceLandmarks().withFaceDescriptor();
+        
+        if (!detections) {
+          throw new Error('រកមិនឃើញផ្ទៃមុខ។ (No face detected)');
+        }
+        
+        const liveDescriptor = Array.from(detections.descriptor) as number[];
+        
+        // 2. Fetch all enrollments (simulate Server Fetch)
+        const enrollments = await db.getFaceEnrollments();
+        
+        // 3. Auto-match against ALL employees (Threshold 0.5)
+        let bestDistance = 1.0;
+        let matchedEmployeeId = null;
+
+        for (const e of enrollments) {
+          const distance = faceapi.euclideanDistance(new Float32Array(liveDescriptor), new Float32Array(e.descriptor));
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            matchedEmployeeId = e.employee_id;
+          }
+        }
+        
+        if (bestDistance <= 0.5 && matchedEmployeeId === selectedEmployee.id) {
+          photoMatched = true;
+          matchingScore = (1 - bestDistance) * 100;
+          notesText = `ជីវមាត្រផ្ទៀងផ្ទាត់ជោគជ័យ! (Matched with threshold ${bestDistance.toFixed(2)})`;
+        } else if (bestDistance <= 0.5) {
+          photoMatched = false;
+          matchingScore = 0;
+          notesText = `កំណត់សម្គាល់ខុស៖ មុខនេះចុះឈ្មោះជាបុគ្គលិកផ្សេង។ (Matched WRONG employee!)`;
+        } else {
+          photoMatched = false;
+          matchingScore = 0;
+          notesText = `មិនមានទិន្នន័យផ្ទៀងផ្ទាត់សោះ! (No match found > 0.5 threshold)`;
+        }
+        
+        setFaceMatchResult({ matched: photoMatched, score: matchingScore, notes: notesText });
+
+        if (!photoMatched) {
+          alert('ការផ្ទៀងផ្ទាត់ផ្ទៃមុខបរាជ័យ (Face Match Failed)\n' + notesText);
+          setIsMatchingFace(false);
+          return; // Block submit
+        }
+        
+      } catch (err: any) {
+        console.error('AI Face Matching error:', err);
+        alert(err.message || 'AI Face matching failed!');
         setIsMatchingFace(false);
+        return;
       }
+      setIsMatchingFace(false);
     }
 
     // NFC details mapping
@@ -367,7 +519,17 @@ export default function SecureAttendPage() {
 
     // QR Code Check
     if (activeTab === 'QR') {
-      notesText = `បានស្កែនស្វ័យប្រវត្ត QR កូដ៖ ${selectedEmployee.qr_key || 'SecureAttend-QR'}`;
+      if (!scannedQrSecret) {
+        alert('សូមស្កែនកូដ QR! (Please scan the Office QR Code)');
+        return;
+      }
+      const tenantSecret = localStorage.getItem(`secureattend_office_qr_${selectedTenant.id}`);
+      if (!tenantSecret || scannedQrSecret !== tenantSecret) {
+        alert('កូដ QR មិនត្រឹមត្រូវ ឬហួសសុពលភាព! (Invalid or Expired QR Code)');
+        return;
+      }
+      geofenceOk = true;
+      notesText = `បានស្កែនស្វ័យប្រវត្ត QR កូដនៃការិយាល័យ`;
     }
 
     // Determine status (ON_TIME vs LATE based on current clock hour)
@@ -489,6 +651,28 @@ export default function SecureAttendPage() {
     setNewEmpPhoto(picked);
   };
 
+  const generateOfficeQr = async (tenantId: string, forceNew = false) => {
+    let secret = localStorage.getItem(`secureattend_office_qr_${tenantId}`);
+    if (!secret || forceNew) {
+      secret = `SA_OFFICE_${tenantId}_${Math.random().toString(36).substring(2, 15)}`;
+      localStorage.setItem(`secureattend_office_qr_${tenantId}`, secret);
+    }
+    try {
+      const url = await QRCode.toDataURL(secret, { width: 400, color: { dark: '#0F172A', light: '#FFFFFF' } });
+      setOfficeQrDataUrl(url);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedTenant && hrActiveTab === 'OFFICE_QR') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      generateOfficeQr(selectedTenant.id);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTenant, hrActiveTab]);
+
   // --- ACTION: PAYROLL CALCULATION ---
   const handleCalculatePayroll = async () => {
     if (!selectedTenant) return;
@@ -599,12 +783,12 @@ export default function SecureAttendPage() {
       <div className="absolute bottom-[-15%] left-[20%] w-[50%] h-[50%] rounded-full bg-violet-800/10 blur-[140px] pointer-events-none" />
 
       {/* NAV / TITLE CONTAINER */}
-      <header className="border-b border-slate-900 bg-slate-900/60 backdrop-blur-xl sticky top-0 z-40 px-4 sm:px-6 py-4" id="main_header">
+      <header className="border-b border-indigo-500/20 bg-gradient-to-r from-slate-950/95 via-slate-900/90 to-indigo-950/95 shadow-lg shadow-black/40 backdrop-blur-xl sticky top-0 z-40 px-4 sm:px-6 py-4" id="main_header">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
           
           {/* Logo Brand Title */}
           <div className="flex items-center gap-3.5">
-            <div className="p-3 rounded-2xl bg-gradient-to-tr from-indigo-600 via-indigo-505 to-violet-600 shadow-lg shadow-indigo-600/20 border border-indigo-400/30 flex items-center justify-center">
+            <div className="p-3 rounded-2xl bg-gradient-to-tr from-brand-primary via-indigo-505 to-brand-purple shadow-lg shadow-neon-glow-indigo border border-indigo-405/30 flex items-center justify-center">
               <Fingerprint className="w-7 h-7 text-white animate-pulse" />
             </div>
             <div>
@@ -612,7 +796,7 @@ export default function SecureAttendPage() {
                 <h1 className="text-2xl font-bold tracking-tight bg-gradient-to-r from-indigo-100 via-slate-100 to-indigo-300 bg-clip-text text-transparent">
                   SecureAttend
                 </h1>
-                <span className="text-[10px] bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 px-2 py-0.5 rounded-full font-mono font-semibold tracking-wider">
+                <span className="text-[10px] bg-brand-primary/10 border border-indigo-500/20 text-indigo-400 px-2 py-0.5 rounded-full font-mono font-semibold tracking-wider shadow-inner-soft">
                   V4.2 PRO
                 </span>
               </div>
@@ -622,9 +806,18 @@ export default function SecureAttendPage() {
             </div>
           </div>
 
+          {/* REAL-TIME CLOCK IN GRADIENT HEADER */}
+          <div className="hidden lg:flex items-center gap-2.5 bg-slate-950/80 border border-slate-800 rounded-xl px-3.5 py-1.5 shadow-inner-soft">
+            <Clock className="w-4 h-4 text-cyan-400 animate-pulse" />
+            <span className="text-xs text-slate-450 font-medium font-sans">នាឡិកាប្រព័ន្ធ៖</span>
+            <span className="text-xs font-mono font-bold tracking-wider text-cyan-300">
+              {currentTime ? currentTime.toLocaleTimeString('kh-KH') : '15:16:18'}
+            </span>
+          </div>
+
           {/* TENANT SWITCHER & OPTIONS */}
           <div className="flex flex-wrap items-center gap-3 w-full md:w-auto justify-end">
-            <div className="flex items-center gap-2 bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-1.5 shadow">
+            <div className="flex items-center gap-2 bg-slate-950/85 border border-slate-800 rounded-xl px-3 py-1.5 shadow-lg">
               <div className="flex items-center gap-1.5">
                 <Building2 className="w-4 h-4 text-indigo-400" />
                 <span className="text-xs text-slate-300 font-medium hidden sm:inline">ស្ថាប័ន៖</span>
@@ -666,6 +859,82 @@ export default function SecureAttendPage() {
 
         </div>
       </header>
+
+      {/* GREETING HERO SECTION */}
+      <section className="bg-gradient-to-b from-indigo-950/20 via-slate-950/10 to-transparent pt-8 pb-4 px-4 sm:px-6" id="greeting_hero">
+        <div className="max-w-7xl mx-auto">
+          <motion.div 
+            initial={{ opacity: 0, y: 15 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6 }}
+            className="relative overflow-hidden bg-slate-900/40 border border-slate-800/80 rounded-3xl p-6 sm:p-8 flex flex-col md:flex-row items-center justify-between gap-6 shadow-2xl"
+          >
+            {/* Soft Ambient Background Glow inside the Hero */}
+            <div className="absolute top-0 right-0 w-80 h-80 rounded-full bg-brand-primary/10 blur-[80px] pointer-events-none -mr-20 -mt-20" />
+            <div className="absolute bottom-0 left-0 w-64 h-64 rounded-full bg-brand-secondary/5 blur-[60px] pointer-events-none -ml-16 -mb-16" />
+
+            {/* Left Column: Greeting and Owner Info */}
+            <div className="flex flex-col sm:flex-row items-center sm:items-start gap-5 z-10 text-center sm:text-left">
+              <div className="p-4 rounded-2xl bg-gradient-to-tr from-brand-primary/20 to-brand-secondary/20 border border-brand-primary/30 shadow-inner-soft flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-8 h-8 text-cyan-400 animate-pulse" />
+              </div>
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-indigo-400/90 uppercase tracking-widest font-mono">
+                  {(() => {
+                    const hrs = currentTime ? currentTime.getHours() : 15;
+                    if (hrs < 12) return 'អរុណសួស្តី • Good Morning';
+                    if (hrs < 17) return 'ទិវាសួស្តី • Good Afternoon';
+                    return 'សាយ័ណ្ហសួស្តី • Good Evening';
+                  })()}
+                </span>
+                
+                <h2 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight leading-none">
+                  សួស្តី <span className="bg-gradient-to-r from-indigo-200 via-cyan-200 to-emerald-300 bg-clip-text text-transparent drop-shadow-sm font-bold">ឡុង មករា (Long Makara)</span>!
+                </h2>
+                
+                <p className="text-xs text-slate-400 pt-1">
+                  គណនីម្ចាស់ស្ថាប័ន៖ <span className="font-mono text-cyan-300 font-medium select-all">long.makara.hs@moeys.gov.kh</span>
+                  <span className="mx-2 text-slate-600">|</span> 
+                  តួនាទី៖ <span className="text-slate-200 font-medium">អ្នកគ្រប់គ្រងប្រព័ន្ធជាន់ខ្ពស់ (Super Admin)</span>
+                </p>
+
+                <div className="flex flex-wrap gap-2 pt-3 items-center justify-center sm:justify-start">
+                  <span className="inline-flex items-center gap-1.5 text-[11px] bg-brand-primary/10 border border-brand-primary/20 text-indigo-400 px-3 py-1 rounded-lg font-medium shadow-sm">
+                    <span className="w-1.5 h-1.5 bg-brand-primary rounded-full animate-ping" />
+                    គណនីសកម្ម / Secure Active
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-[11px] bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 px-3 py-1 rounded-lg font-medium shadow-sm">
+                    <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full" />
+                    ប្រព័ន្ធសុវត្ថិភាពខ្ពស់បំផុត
+                  </span>
+                  <span className="text-xs text-slate-500 italic hidden lg:inline ml-1 font-sans">
+                    គ្រប់គ្រង HR និងផេគើលដោយបញ្ញាសិប្បនិម្មិត
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Column: Mini Dashboard Real-Time clock and Date Display */}
+            <div className="flex flex-col items-center md:items-end gap-1.5 z-10 bg-slate-950/60 border border-slate-800/60 p-5 rounded-2xl min-w-[250px] text-center md:text-right shadow-lg">
+              <div className="text-[10px] text-cyan-400 uppercase font-mono tracking-widest font-semibold flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 animate-spin" style={{ animationDuration: '6s' }} />
+                នាឡិកាប្រព័ន្ធពិតប្រាកដ / Real-Time Clock
+              </div>
+              <div className="text-2xl sm:text-3xl font-black font-mono tracking-wider text-white drop-shadow-md">
+                {currentTime ? currentTime.toLocaleTimeString('kh-KH') : '15:16:18'}
+              </div>
+              <div className="text-[11px] text-slate-300 font-medium">
+                {currentTime ? currentTime.toLocaleDateString('kh-KH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'ពុធ, ១០ មិថុនា ២០២៦'}
+              </div>
+              <div className="text-[9px] text-slate-500 italic font-mono mt-0.5">
+                ISO 8601: {currentTime ? currentTime.toISOString() : '2026-06-10T15:16:18Z'}
+              </div>
+            </div>
+
+          </motion.div>
+        </div>
+      </section>
+
 
       {/* DYNAMIC LEADERBOARD STATS BAR (High Impact Display) */}
       <section className="bg-slate-900/30 py-6 px-4 border-b border-slate-900" id="stats_panel">
@@ -844,10 +1113,18 @@ export default function SecureAttendPage() {
                 </div>
 
                 {selectedEmployee && (
-                  <div className="grid grid-cols-3 gap-2 mt-3 pt-2.5 border-t border-slate-900 text-[10px] text-indigo-300/80 font-mono bg-slate-900/30 p-2 rounded-lg">
-                    <div className="truncate" title={selectedEmployee.nfc_tag_id}>📟 NFC: {selectedEmployee.nfc_tag_id?.substring(0, 10)}...</div>
-                    <div className="truncate" title={selectedEmployee.qr_key}>🎫 QR: {selectedEmployee.qr_key?.substring(0, 10)}...</div>
-                    <div className="truncate">🔑 PIN: {selectedEmployee.pin_code}</div>
+                  <div className="mt-3 pt-2.5 border-t border-slate-900">
+                    <div className="grid grid-cols-3 gap-2 text-[10px] text-indigo-300/80 font-mono bg-slate-900/30 p-2 rounded-lg mb-2">
+                      <div className="truncate" title={selectedEmployee.nfc_tag_id}>📟 NFC: {selectedEmployee.nfc_tag_id?.substring(0, 10)}...</div>
+                      <div className="truncate" title={selectedEmployee.qr_key}>🎫 QR: {selectedEmployee.qr_key?.substring(0, 10)}...</div>
+                      <div className="truncate">🔑 PIN: {selectedEmployee.pin_code}</div>
+                    </div>
+                    <button
+                      onClick={() => setShowFaceEnrollModal(true)}
+                      className="w-full py-2 bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/40 text-emerald-300 text-[11px] font-bold rounded-lg transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <ScanFace className="w-3.5 h-3.5" /> Register AI Face Biometrics
+                    </button>
                   </div>
                 )}
               </div>
@@ -1115,36 +1392,43 @@ export default function SecureAttendPage() {
                   </div>
                 )}
 
-                {/* TAB 3: SMART QR CODE SCREEN CARD */}
+                {/* TAB 3: SMART QR CODE SCANNER */}
                 {activeTab === 'QR' && selectedTenant && selectedEmployee && (
-                  <div className="w-full flex flex-col items-center gap-4 flex-1 justify-center">
-                    
-                    {/* Glowing Modern Digital QR Ticket Card */}
-                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-3xl flex flex-col items-center shadow-lg transform hover:scale-[1.02] transition-all relative">
-                      <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-500 to-violet-500 rounded-t-3xl" />
-                      
-                      <div className="bg-white p-3 rounded-2xl border-2 border-indigo-400/20 flex items-center justify-center relative">
-                        <div className="w-28 h-28 relative">
-                          <QrCode className="w-full h-full text-slate-900" />
-                        </div>
-                        {/* Miniature floating central shield watermark logo */}
-                        <div className="absolute w-7 h-7 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] select-none shadow">
-                          SA
-                        </div>
+                  <div className="w-full flex flex-col items-center gap-4 flex-1 justify-center relative">
+                    {!isScanningQr ? (
+                      <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl flex flex-col items-center shadow-lg text-center relative max-w-[280px]">
+                        <QrCode className="w-12 h-12 text-indigo-400 mb-3" />
+                        <h4 className="text-sm font-bold text-slate-100 mb-1">Scan Office QR</h4>
+                        <p className="text-[10px] text-slate-400 mb-4">
+                          Aim your camera at the secure office QR code to log your attendance.
+                        </p>
+                        <button 
+                          onClick={() => { setIsScanningQr(true); setScannedQrSecret(''); }}
+                          className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-2 px-5 rounded-full"
+                        >
+                          Start Scanner
+                        </button>
+                        {scannedQrSecret && (
+                          <div className="mt-4 p-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] font-mono rounded-lg break-all">
+                            Scanned: {scannedQrSecret.substring(0, 16)}...
+                          </div>
+                        )}
                       </div>
-
-                      <div className="text-[10px] mt-2.5 font-mono text-indigo-400 font-bold bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 rounded-lg">
-                        {selectedEmployee.qr_key || 'COMPILING_PASSPORT'}
+                    ) : (
+                      <div className="w-full max-w-[300px] bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden relative shadow-lg">
+                        <Scanner 
+                           onScan={handleScanQr} 
+                           onError={(error) => console.error(error?.message)}
+                           classNames={{ container: 'w-full h-[280px]' }}
+                        />
+                        <button 
+                          onClick={() => setIsScanningQr(false)}
+                          className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-800/80 backdrop-blur border border-slate-700 text-slate-300 hover:text-white px-4 py-1.5 rounded-full text-xs font-bold"
+                        >
+                          Cancel
+                        </button>
                       </div>
-                    </div>
-
-                    <div className="space-y-1">
-                      <h4 className="text-xs font-bold text-slate-200">លេខសម្គាល់បុគ្គលិក QR Passport</h4>
-                      <p className="text-[10px] text-slate-400 max-w-[280px]">
-                        បង្ហាញកូដ QR នេះទៅកាន់ប្រព័ន្ធស្កែនស្វ័យប្រវត្តរបស់ស្ថាប័ន {selectedTenant.name_kh} ដើម្បីបញ្ចប់ការចុះឈ្មោះវត្តមាន។
-                      </p>
-                    </div>
-
+                    )}
                   </div>
                 )}
 
@@ -1362,7 +1646,8 @@ export default function SecureAttendPage() {
                   { id: 'OVERVIEW', label: '📊 បូកសរុប (Overview)' },
                   { id: 'LOGS', label: '📋 កំណត់ត្រាវត្តមាន (Attendance Logs)' },
                   { id: 'LEAVES', label: '📝 សំណើច្បាប់ (Leave Requests)' },
-                  { id: 'PAYROLL', label: '💵 បើកប្រាក់បៀវត្សរ៍ (Payroll Ledger)' }
+                  { id: 'PAYROLL', label: '💵 បើកប្រាក់បៀវត្សរ៍ (Payroll Ledger)' },
+                  { id: 'OFFICE_QR', label: '📷 បង្កើតកូដ QR ក្រុមហ៊ុន (Office QR)' }
                 ].map((th) => (
                   <button
                     key={th.id}
@@ -1744,6 +2029,52 @@ export default function SecureAttendPage() {
                 </div>
               )}
 
+              {/* TAB CONTAINER 5: OFFICE QR GENERATION */}
+              {hrActiveTab === 'OFFICE_QR' && selectedTenant && (
+                <div className="space-y-6">
+                  <div className="bg-slate-950 p-6 rounded-3xl border border-slate-850 flex flex-col md:flex-row items-center justify-between gap-6 relative overflow-hidden">
+                    <div className="absolute inset-0 bg-gradient-to-tr from-indigo-500/5 to-transparent pointer-events-none" />
+                    <div className="flex-1 space-y-3 relative z-10">
+                      <h4 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                        <QrCode className="w-5 h-5 text-indigo-400" />
+                        Office Attendance QR
+                      </h4>
+                      <p className="text-[11px] text-slate-400 max-w-[400px]">
+                        This QR code should be displayed at the office entrance. Employees will scan this code using the SecureAttend app to safely record their attendance.
+                      </p>
+                      
+                      <div className="flex items-center gap-3 pt-3">
+                        <button
+                          onClick={() => generateOfficeQr(selectedTenant.id, true)}
+                          className="bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/30 px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5"
+                        >
+                          <RefreshCw className="w-4 h-4" /> Regenerate Secret
+                        </button>
+                        {officeQrDataUrl && (
+                          <a 
+                            href={officeQrDataUrl} 
+                            download={`Office_QR_${selectedTenant.name_en.replace(/ /g, '_')}.png`}
+                            className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5"
+                          >
+                            Download PNG
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                    
+                    {officeQrDataUrl ? (
+                      <div className="w-48 h-48 sm:w-56 sm:h-56 bg-white p-4 rounded-2xl shrink-0 shadow-lg relative z-10 border-4 border-indigo-500/20">
+                        <img src={officeQrDataUrl} alt="Office QR Code" className="w-full h-full object-contain" />
+                      </div>
+                    ) : (
+                      <div className="w-48 h-48 bg-slate-900 border-2 border-dashed border-slate-800 rounded-2xl flex items-center justify-center relative z-10">
+                        <span className="text-xs text-slate-500 font-bold">No QR Generated</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
             </div>
 
           </div>
@@ -1767,6 +2098,80 @@ export default function SecureAttendPage() {
           </div>
         </div>
       </footer>
+
+      {/* MODAL 2: FACE ENROLLMENT MODAL */}
+      <AnimatePresence>
+        {showFaceEnrollModal && selectedEmployee && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-slate-950 border border-slate-800 p-6 sm:p-8 rounded-3xl w-full max-w-md shadow-2xl relative"
+            >
+              <div className="flex justify-between items-center border-b border-slate-850 pb-3 mb-4">
+                <div>
+                  <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                    <ScanFace className="w-5 h-5 text-emerald-400" /> Face Registration
+                  </h3>
+                  <p className="text-[10px] text-slate-400 mt-0.5">Register biometric identity for {selectedEmployee.full_name_en}</p>
+                </div>
+                <button 
+                  onClick={() => {
+                    stopEnrollCamera();
+                    setShowFaceEnrollModal(false);
+                  }}
+                  className="text-slate-500 hover:text-slate-300 transition"
+                >
+                  <XCircle className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="flex flex-col items-center gap-4">
+                {!isFaceApiLoaded ? (
+                  <div className="text-sm text-slate-400 py-10">Loading Face API Models...</div>
+                ) : (
+                  <>
+                    <div className="relative w-full max-w-[280px] h-44 bg-slate-900 border-2 border-slate-800 rounded-2xl overflow-hidden flex items-center justify-center">
+                      {!enrollCameraActive ? (
+                        <div className="text-slate-500 flex flex-col items-center gap-2 select-none">
+                          <button onClick={startEnrollCamera} className="bg-indigo-600 px-4 py-2 rounded-xl text-white font-bold text-xs">
+                            Start Camera
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <video 
+                            ref={enrollVideoRef} 
+                            autoPlay 
+                            playsInline 
+                            className="w-full h-full object-cover transform -scale-x-100"
+                          />
+                          <div className="absolute inset-x-0 bottom-3 flex justify-center z-20">
+                            <button 
+                              onClick={captureAndEnrollFace}
+                              className="bg-emerald-600 px-5 py-2 rounded-full text-white font-bold text-xs shadow-lg"
+                            >
+                              Scan & Enroll Face
+                            </button>
+                          </div>
+                        </>
+                      )}
+                      <canvas ref={enrollCanvasRef} className="hidden" />
+                    </div>
+
+                    {faceEnrollStatus && (
+                      <div className="mt-2 text-xs font-bold text-center p-2 rounded bg-slate-900 border border-slate-800">
+                        {faceEnrollStatus}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* MODAL 1: NEW EMPLOYEE REGISTRATION ENTRY FORM */}
       <AnimatePresence>
