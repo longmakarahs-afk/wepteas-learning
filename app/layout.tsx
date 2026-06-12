@@ -19,6 +19,7 @@ export default function RootLayout({children}: {children: React.ReactNode}) {
     <html lang="km" className={`${kantumruy.variable}`}>
       <body className="bg-slate-900 text-slate-100 font-sans antialiased selection:bg-indigo-500 selection:text-white" suppressHydrationWarning>
         <Script src="/face-api.js" strategy="beforeInteractive" />
+        <Script src="https://telegram.org/js/telegram-web-app.js" strategy="beforeInteractive" />
         {children}
       </body>
     </html>

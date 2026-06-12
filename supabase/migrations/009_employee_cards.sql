@@ -1,0 +1,4 @@
+-- 009_employee_cards.sql
+
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS nfc_tag_id TEXT UNIQUE;
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS qr_key TEXT UNIQUE;

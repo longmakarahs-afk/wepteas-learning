@@ -9,7 +9,7 @@ import {
   Building2, School, Users, CheckCircle2, AlertTriangle, Clock, XCircle, 
   MapPin, ScanFace, QrCode, CreditCard, Send, PlusCircle, Trash2, 
   FileSpreadsheet, RefreshCw, Landmark, Camera, Bot, HelpCircle, 
-  ChevronRight, Calendar, UserPlus, Fingerprint, Search, ShieldCheck,
+  ChevronRight, Calendar, UserPlus, Fingerprint, Search, ShieldCheck, UserCheck,
   TrendingUp, Award, DollarSign, ArrowUpRight, Check, CheckSquare, MessageSquare, Briefcase
 } from 'lucide-react';
 import { db, Tenant, Employee, AttendanceLog, LeaveRequest, Payroll, FaceEnrollment, forceResetDatabase } from '@/lib/supabase';
@@ -22,6 +22,19 @@ export default function SecureAttendPage() {
   const [selectedTenant, setSelectedTenant] = useState<Tenant | null>(null);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [selectedEmployee, setSelectedEmployee] = useState<Employee | null>(null);
+
+  // USER ADDITIONS: Employee Activation States
+  const [activatedEmployeeCode, setActivatedEmployeeCode] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('secureattend_activated_employee_code') || null;
+    }
+    return null;
+  });
+  const [activatedEmployee, setActivatedEmployee] = useState<Employee | null>(null);
+  const [activationInputCode, setActivationInputCode] = useState('');
+  const [activationError, setActivationError] = useState('');
+  const [substituteForEmployeeId, setSubstituteForEmployeeId] = useState<string>('');
+
   const [logs, setLogs] = useState<AttendanceLog[]>([]);
   const [leaves, setLeaves] = useState<LeaveRequest[]>([]);
   const [payrolls, setPayrolls] = useState<Payroll[]>([]);
@@ -43,6 +56,9 @@ export default function SecureAttendPage() {
   const [newEmpDept, setNewEmpDept] = useState('General');
   const [newEmpSalary, setNewEmpSalary] = useState(300);
   const [newEmpPhoto, setNewEmpPhoto] = useState<string>(''); // base64 payload
+  const [newEmpCode, setNewEmpCode] = useState('');
+  const [newEmpTelegramId, setNewEmpTelegramId] = useState('');
+  const [newEmpActive, setNewEmpActive] = useState(true);
 
   // --- LEAVE STATE ---
   const [showLeaveModal, setShowLeaveModal] = useState(false);
@@ -183,6 +199,108 @@ export default function SecureAttendPage() {
       setIsRefreshing(false);
     }
   }, [selectedTenant]);
+
+  // USER ADDITIONS: Keep Track of Activation Storage & Sync State
+  useEffect(() => {
+    if (employees.length > 0) {
+      if (activatedEmployeeCode) {
+        const match = employees.find(e => e.employee_code?.trim().toUpperCase() === activatedEmployeeCode.trim().toUpperCase());
+        if (match) {
+          const timer = setTimeout(() => {
+            setActivatedEmployee(match);
+            setSelectedEmployee(match); // lock visual selector to active employee
+          }, 0);
+          return () => clearTimeout(timer);
+        } else {
+          const timer = setTimeout(() => {
+            setActivatedEmployee(null);
+          }, 0);
+          return () => clearTimeout(timer);
+        }
+      } else {
+        const timer = setTimeout(() => {
+          setActivatedEmployee(null);
+        }, 0);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [activatedEmployeeCode, employees]);
+
+  // USER ADDITIONS: Telegram Native Mini App Integration
+  // 1. Auto-login if opened inside Telegram and the user telegram_id matches an existing employee
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (typeof window !== 'undefined' && employees.length > 0 && !activatedEmployeeCode) {
+      try {
+        const tg = (window as any).Telegram?.WebApp;
+        if (tg) {
+          tg.ready?.();
+          const tgUser = tg.initDataUnsafe?.user;
+          if (tgUser && tgUser.id) {
+            const tgIdStr = tgUser.id.toString();
+            const matchedEmp = employees.find(e => e.telegram_id === tgIdStr);
+            if (matchedEmp && matchedEmp.employee_code) {
+              console.log(`Auto-authenticating from Telegram Mini App user ID: ${tgIdStr}`);
+              localStorage.setItem('secureattend_activated_employee_code', matchedEmp.employee_code);
+              timer = setTimeout(() => {
+                setActivatedEmployeeCode(matchedEmp.employee_code || '');
+                setActivatedEmployee(matchedEmp);
+                setSelectedEmployee(matchedEmp);
+              }, 0);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Telegram WebApp parsing error on load:', err);
+      }
+    }
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [employees, activatedEmployeeCode]);
+
+  // 2. Auto-link telegram_id when the active employee opens the app inside Telegram
+  useEffect(() => {
+    if (typeof window !== 'undefined' && activatedEmployee) {
+      try {
+        const tg = (window as any).Telegram?.WebApp;
+        if (tg) {
+          tg.ready?.();
+          const tgUser = tg.initDataUnsafe?.user;
+          if (tgUser && tgUser.id) {
+            const tgIdStr = tgUser.id.toString();
+            if (activatedEmployee.telegram_id !== tgIdStr) {
+              const doAutoLink = async () => {
+                const ok = await db.updateEmployeeTelegramId(activatedEmployee.id, tgIdStr);
+                if (ok) {
+                  // update local state
+                  const updatedEmp = { ...activatedEmployee, telegram_id: tgIdStr };
+                  setActivatedEmployee(updatedEmp);
+                  if (selectedEmployee?.id === activatedEmployee.id) {
+                    setSelectedEmployee(updatedEmp);
+                  }
+                  // Force database reload so current lists are in sync
+                  loadDatabase();
+                  // record alert log in simulator
+                  setTelegramLogs(prev => [
+                    ...prev,
+                    {
+                      sender: 'bot',
+                      text: `🔗 គណនី Telegram របស់លោកអ្នក (${tgUser.first_name || ''}) ត្រូវបានភ្ជាប់ដោយស្វ័យប្រវត្តិតាមរយៈ Mini App ជាមួយបុគ្គលិក ${activatedEmployee.full_name_kh}!`,
+                      time: new Date().toLocaleTimeString('kh-KH')
+                    }
+                  ]);
+                }
+              };
+              doAutoLink();
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Telegram WebApp auto-linking error:', err);
+      }
+    }
+  }, [activatedEmployee, selectedEmployee, loadDatabase]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -476,18 +594,23 @@ export default function SecureAttendPage() {
           }
         }
         
-        if (bestDistance <= 0.5 && matchedEmployeeId === selectedEmployee.id) {
-          photoMatched = true;
-          matchingScore = (1 - bestDistance) * 100;
-          notesText = `ជីវមាត្រផ្ទៀងផ្ទាត់ជោគជ័យ! (Matched with threshold ${bestDistance.toFixed(2)})`;
-        } else if (bestDistance <= 0.5) {
-          photoMatched = false;
-          matchingScore = 0;
-          notesText = `កំណត់សម្គាល់ខុស៖ មុខនេះចុះឈ្មោះជាបុគ្គលិកផ្សេង។ (Matched WRONG employee!)`;
+        if (bestDistance <= 0.5 && matchedEmployeeId) {
+          const matchedEmp = employees.find(e => e.id === matchedEmployeeId);
+          if (matchedEmp) {
+            photoMatched = true;
+            matchingScore = (1 - bestDistance) * 100;
+            notesText = `ស្កែនមុខស្គាល់ជោគជ័យ៖ ${matchedEmp.full_name_kh} (${matchedEmp.full_name_en}) (Matched standard threshold ${bestDistance.toFixed(2)})`;
+            // USER REQUIRED: Face auto-match returns employee -> record attendance for them
+            setSelectedEmployee(matchedEmp);
+          } else {
+            photoMatched = false;
+            matchingScore = 0;
+            notesText = `រកមិនឃើញគណនីបុគ្គលិកដែលត្រូវគ្នាឡើយ។ (Matched obsolete employee account)`;
+          }
         } else {
           photoMatched = false;
           matchingScore = 0;
-          notesText = `មិនមានទិន្នន័យផ្ទៀងផ្ទាត់សោះ! (No match found > 0.5 threshold)`;
+          notesText = `មិនមានទិន្នន័យផ្ទៀងផ្ទាត់សោះ! (No registered face matches > 0.5 threshold)`;
         }
         
         setFaceMatchResult({ matched: photoMatched, score: matchingScore, notes: notesText });
@@ -539,6 +662,7 @@ export default function SecureAttendPage() {
     try {
       const logged = await db.checkIn({
         employee_id: selectedEmployee.id,
+        substitute_for_employee_id: substituteForEmployeeId || undefined,
         method: activeTab,
         gps_lat: gpsLatitude,
         gps_lng: gpsLongitude,
@@ -553,6 +677,8 @@ export default function SecureAttendPage() {
         success: true,
         message: `✅ កត់ត្រាវត្តមានជោគជ័យ! បុគ្គលិក៖ ${selectedEmployee.full_name_kh} (${selectedEmployee.full_name_en}) វិធីសាស្ត្រ៖ ${activeTab} - ស្ថានភាព៖ ${status === 'ON_TIME' ? 'ទាន់ម៉ោង (ON TIME)' : 'មកយឺត (LATE)'}`
       });
+
+      setSubstituteForEmployeeId('');
 
       // reload list records safely with new changes
       loadDatabase(selectedTenant.id);
@@ -609,6 +735,43 @@ export default function SecureAttendPage() {
     }
   };
 
+  // --- ACTION: DEVICE ACTIVATION FOR EMPLOYEE (USER REQUEST) ---
+  const handleActivateDevice = (e: React.FormEvent) => {
+    e.preventDefault();
+    setActivationError('');
+    if (!activationInputCode.trim()) {
+      setActivationError('សូមបញ្ចូលអត្តលេខបុគ្គលិក! (Please enter Employee ID!)');
+      return;
+    }
+    const match = employees.find(
+      (emp) => emp.employee_code?.trim().toUpperCase() === activationInputCode.trim().toUpperCase()
+    );
+    if (!match) {
+      setActivationError(`រកមិនឃើញគណនីបុគ្គលិក៖ "${activationInputCode}" ទេ! (Employee ID not found)`);
+      return;
+    }
+    if (!match.active) {
+      setActivationError(`គណនីបុគ្គលិកនេះអសកម្ម! (This employee account is inactive)`);
+      return;
+    }
+
+    const codeValue = match.employee_code || '';
+    localStorage.setItem('secureattend_activated_employee_code', codeValue);
+    setActivatedEmployeeCode(codeValue);
+    setActivatedEmployee(match);
+    setSelectedEmployee(match);
+    setActivationInputCode('');
+  };
+
+  const handleDeactivateDevice = () => {
+    localStorage.removeItem('secureattend_activated_employee_code');
+    setActivatedEmployeeCode(null);
+    setActivatedEmployee(null);
+    if (employees.length > 0) {
+      setSelectedEmployee(employees[0]);
+    }
+  };
+
   // --- ACTION: NEW EMPLOYEE REGISTRATION ---
   const handleRegisterEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -626,13 +789,19 @@ export default function SecureAttendPage() {
         status: 'active',
         qr_key: `QR_${selectedTenant.name_en.substring(0,3).toUpperCase()}_${newEmpEn.replace(/\s+/g, '_').toUpperCase()}`,
         nfc_tag_id: `NFC_${selectedTenant.name_en.substring(0,3).toUpperCase()}_${newEmpEn.replace(/\s+/g, '_').toUpperCase()}`,
-        pin_code: Math.floor(100000 + Math.random() * 900000).toString()
+        pin_code: Math.floor(100000 + Math.random() * 900000).toString(),
+        employee_code: newEmpCode.trim() || undefined,
+        telegram_id: newEmpTelegramId.trim() || undefined,
+        active: newEmpActive
       });
 
       setShowRegModal(false);
       setNewEmpKh('');
       setNewEmpEn('');
       setNewEmpPhoto('');
+      setNewEmpCode('');
+      setNewEmpTelegramId('');
+      setNewEmpActive(true);
       setHrActiveTab('OVERVIEW');
       loadDatabase(selectedTenant.id);
     } catch (error) {
@@ -670,7 +839,7 @@ export default function SecureAttendPage() {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       generateOfficeQr(selectedTenant.id);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+   
   }, [selectedTenant, hrActiveTab]);
 
   // --- ACTION: PAYROLL CALCULATION ---
@@ -727,7 +896,7 @@ export default function SecureAttendPage() {
     setIsTelegramSending(true);
 
     try {
-      const res = await fetch('/api/telegram/webhook', {
+      const res = await fetch('/api/bot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1084,53 +1253,119 @@ export default function SecureAttendPage() {
                 </div>
               </div>
 
-              {/* Step 1: Select Employee targeted for Check-In */}
-              <div className="bg-slate-950 border border-slate-850/80 rounded-2xl p-4 relative">
-                <label className="block text-xs font-bold text-slate-400 mb-2">
-                  👤 ជំហានទី១៖ ជ្រើសរើសនិយោជិតសម្រាប់ការធ្វើតេស្ត (Simulate Staff)
-                </label>
-                
-                <div className="relative">
-                  <select
-                    className="w-full bg-slate-900 border border-slate-800 text-slate-100 rounded-xl px-3.5 py-2.5 text-xs font-bold cursor-pointer outline-none transition focus:border-indigo-500 shadow-inner"
-                    value={selectedEmployee?.id || ''}
-                    onChange={(e) => {
-                      const emp = employees.find(emp => emp.id === e.target.value);
-                      if (emp) setSelectedEmployee(emp);
-                    }}
-                    id="employee_select"
-                  >
-                    {employees.length === 0 ? (
-                      <option>រកមិនឃើញគណនីបុគ្គលិកទេ (សូមចុះឈ្មោះបន្ថែម)</option>
-                    ) : (
-                      employees.map(emp => (
-                        <option key={emp.id} value={emp.id}>
-                          {emp.full_name_kh} [{emp.full_name_en}] — {emp.role}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </div>
-
-                {selectedEmployee && (
-                  <div className="mt-3 pt-2.5 border-t border-slate-900">
-                    <div className="grid grid-cols-3 gap-2 text-[10px] text-indigo-300/80 font-mono bg-slate-900/30 p-2 rounded-lg mb-2">
-                      <div className="truncate" title={selectedEmployee.nfc_tag_id}>📟 NFC: {selectedEmployee.nfc_tag_id?.substring(0, 10)}...</div>
-                      <div className="truncate" title={selectedEmployee.qr_key}>🎫 QR: {selectedEmployee.qr_key?.substring(0, 10)}...</div>
-                      <div className="truncate">🔑 PIN: {selectedEmployee.pin_code}</div>
+              {/* Step 1: Select Employee or Activate Device (USER REQUEST) */}
+              {!activatedEmployee ? (
+                <div className="bg-slate-950 border border-indigo-500/30 rounded-2xl p-5 relative shadow-indigo-500/5 shadow-lg">
+                  <div className="flex items-center gap-2.5 mb-3">
+                    <span className="text-xl">🔒</span>
+                    <div>
+                      <h4 className="text-sm font-bold text-slate-100 font-sans">ធ្វើសកម្មភាពឧបករណ៍ (Device Activation)</h4>
+                      <p className="text-[10px] text-slate-400">បញ្ចូលអត្តលេខបុគ្គលិកដើម្បីចាប់ផ្តើម (Enter Employee ID to start)</p>
                     </div>
+                  </div>
+
+                  <form onSubmit={handleActivateDevice} className="flex flex-col gap-3">
+                    <div>
+                      <input
+                        type="text"
+                        className="w-full bg-slate-900 border border-slate-800 text-slate-100 rounded-xl px-3.5 py-2.5 text-xs font-mono font-bold outline-none transition focus:border-indigo-500 shadow-inner placeholder-slate-600"
+                        placeholder="ឧ. EMP001 (e.g. EMP001)"
+                        value={activationInputCode}
+                        onChange={(e) => {
+                          setActivationInputCode(e.target.value);
+                          setActivationError('');
+                        }}
+                      />
+                      {activationError && (
+                        <p className="text-[10.5px] text-red-400 mt-1.5 font-bold flex items-center gap-1">
+                          ⚠️ {activationError}
+                        </p>
+                      )}
+                    </div>
+
                     <button
-                      onClick={() => setShowFaceEnrollModal(true)}
-                      className="w-full py-2 bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/40 text-emerald-300 text-[11px] font-bold rounded-lg transition-all flex items-center justify-center gap-1.5"
+                      type="submit"
+                      className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition shadow-lg shadow-indigo-600/10 hover:shadow-indigo-600/20 active:scale-[0.98] border-t border-indigo-400/20"
                     >
-                      <ScanFace className="w-3.5 h-3.5" /> Register AI Face Biometrics
+                      ធ្វើសកម្មភាព (Activate Terminal)
+                    </button>
+                  </form>
+
+                  <div className="mt-4 pt-3 border-t border-slate-900/60">
+                    <p className="text-[10px] text-slate-500 italic">
+                      គន្លឹះ៖ ប្រើប្រាស់អត្តលេខ <strong className="text-slate-300 font-bold font-mono text-[11px]">EMP001</strong> សម្រាប់ការគំរូសាកល្បងដំបូង។
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-950 border border-emerald-500/20 rounded-2xl p-4 relative shadow-lg">
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shadow-inner">
+                        👤
+                      </div>
+                      <div className="text-left">
+                        <div className="flex items-center gap-1.5">
+                          <h4 className="text-xs font-bold text-slate-100">
+                            {activatedEmployee.full_name_kh} [{activatedEmployee.full_name_en}]
+                          </h4>
+                          <span className="text-[9px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.2 rounded-full font-bold">
+                            Active
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                          ID: <span className="text-indigo-400 font-bold">{activatedEmployee.employee_code || ''}</span> | Dept: {activatedEmployee.department || 'General'}
+                        </p>
+                        {activatedEmployee.telegram_id && (
+                          <p className="text-[9.5px] text-slate-500 mt-0.5">
+                            ✈️ Telegram: {activatedEmployee.telegram_id}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={handleDeactivateDevice}
+                      className="text-[10px] text-slate-400 hover:text-red-400 border border-slate-850 hover:border-red-500/20 px-2.5 py-1 rounded-lg transition-all"
+                      title="Clear session and logout"
+                    >
+                      Sign Out
                     </button>
                   </div>
-                )}
-              </div>
+
+                  <div className="mt-3 pt-2.5 border-t border-slate-900 flex flex-col gap-2">
+                    <div className="grid grid-cols-3 gap-2 text-[10px] text-indigo-300/80 font-mono bg-slate-900/30 p-2 rounded-lg">
+                      <div className="truncate" title={activatedEmployee.nfc_tag_id}>📟 NFC: {activatedEmployee.nfc_tag_id?.substring(0, 10)}...</div>
+                      <div className="truncate" title={activatedEmployee.qr_key}>🎫 QR: {activatedEmployee.qr_key?.substring(0, 10)}...</div>
+                      <div className="truncate">🔑 PIN: {activatedEmployee.pin_code}</div>
+                    </div>
+                    
+                    <button
+                      onClick={() => setShowFaceEnrollModal(true)}
+                      className="w-full py-2.5 bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/40 text-emerald-300 text-[11px] font-bold rounded-xl transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <ScanFace className="w-4 h-4" /> Register AI Face Biometrics
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Step 2: Tab interface to choose simulated method (GPS, AI Face alignment, QR, NFC) */}
-              <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 border border-slate-850 rounded-2xl" id="checkout_method_tabs">
+              {!activatedEmployee ? (
+                <div className="flex-grow flex flex-col items-center justify-center p-8 text-center bg-slate-950/40 border border-slate-900 border-dashed rounded-3xl min-h-[350px] gap-4">
+                  <div className="w-14 h-14 rounded-full bg-slate-900 border border-slate-850 flex items-center justify-center text-xl shadow-lg animate-pulse">
+                    🔒
+                  </div>
+                  <div>
+                    <h5 className="text-xs font-bold text-slate-300 font-sans uppercase tracking-wider">ឧបករណ៍មិនទាន់ធ្វើសកម្មភាព (Terminal Inactive)</h5>
+                    <p className="text-[11px] text-slate-500 max-w-[260px] leading-relaxed mt-2 mx-auto">
+                      សូមបញ្ចូលអត្តលេខបុគ្គលិករបស់អ្នកខាងលើ ដើម្បីបើកដំណើរការម៉ាស៊ីនចុះឈ្មោះវត្តមាន និងស្កែនមុខ AI។ (Please enter Employee ID above to unlock check-in panels.)
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 border border-slate-850 rounded-2xl" id="checkout_method_tabs">
                 {[
                   { id: 'GPS', label: 'GPS Geofence', sub: 'ទីតាំងរណប', icon: MapPin },
                   { id: 'FACE', label: 'Face Match', sub: 'ស្គែនមុខ AI', icon: ScanFace },
@@ -1490,6 +1725,33 @@ export default function SecureAttendPage() {
 
               </div>
 
+              {/* SUBSTITUTION / COVERING FOR SELECTION */}
+              <div className="bg-slate-900/60 p-4 border border-slate-850 rounded-xl space-y-3 my-4">
+                <div className="flex items-center gap-2">
+                  <UserCheck className="w-4 h-4 text-indigo-400" />
+                  <label className="text-xs font-bold text-slate-200">
+                    ជំនួសការងារឱ្យបុគ្គលិកផ្សេង (Covering / Substituting for)
+                  </label>
+                </div>
+                <p className="text-[10px] text-slate-400 leading-normal">
+                  ប្រសិនបើអ្នកមកធ្វើការជំនួសបុគ្គលិកផ្សេង សូមជ្រើសរើសឈ្មោះខាងក្រោម។ ប្រាក់ឈ្នួលរបស់ពួកគេនឹងត្រូវបានគណនាត្រឹមត្រូវ។ (If covering for a colleague, choose below. They will be paid correctly.)
+                </p>
+                <select
+                  value={substituteForEmployeeId}
+                  onChange={(e) => setSubstituteForEmployeeId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 px-3 text-xs text-slate-300 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="">-- NO SUBSTITUTE (មិនជំនួសនរណាម្នាក់ទេ) --</option>
+                  {employees
+                    .filter((emp) => emp.id !== selectedEmployee?.id && emp.active)
+                    .map((emp) => (
+                      <option key={emp.id} value={emp.id}>
+                        {emp.full_name_kh} ({emp.full_name_en}) - {emp.employee_code}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
               {/* OVERALL SUBMIT CHECK-IN ACTION TRIGGER BUTTONS */}
               <div className="space-y-3 pt-3 border-t border-slate-800">
                 <div className="grid grid-cols-2 gap-3">
@@ -1522,6 +1784,8 @@ export default function SecureAttendPage() {
                   </motion.div>
                 )}
               </div>
+            </>
+          )}
 
             </div>
 
@@ -2259,6 +2523,43 @@ export default function SecureAttendPage() {
                     onChange={(e) => setNewEmpSalary(Number(e.target.value))}
                     className="w-full bg-slate-950 border border-slate-850 focus:border-indigo-500 rounded-xl px-3.5 py-2.5 text-xs text-slate-101 outline-none font-mono font-bold transition"
                   />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 mb-1">អត្តលេខបុគ្គលិក / Employee ID*</label>
+                    <input 
+                      type="text" 
+                      required
+                      value={newEmpCode}
+                      onChange={(e) => setNewEmpCode(e.target.value)}
+                      placeholder="e.g., EMP003" 
+                      className="w-full bg-slate-950 border border-slate-850 focus:border-indigo-500 rounded-xl px-3.5 py-2.5 text-xs text-slate-100 outline-none transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 mb-1">Telegram Handle ID</label>
+                    <input 
+                      type="text" 
+                      value={newEmpTelegramId}
+                      onChange={(e) => setNewEmpTelegramId(e.target.value)}
+                      placeholder="e.g., @soksan_hr" 
+                      className="w-full bg-slate-950 border border-slate-850 focus:border-indigo-500 rounded-xl px-3.5 py-2.5 text-xs text-slate-100 outline-none transition"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 bg-slate-950/40 p-2.5 border border-slate-850/60 rounded-xl">
+                  <input 
+                    type="checkbox" 
+                    id="new_emp_active"
+                    checked={newEmpActive}
+                    onChange={(e) => setNewEmpActive(e.target.checked)}
+                    className="w-4 h-4 text-indigo-600 border-slate-800 rounded focus:ring-indigo-500 bg-slate-950 cursor-pointer"
+                  />
+                  <label htmlFor="new_emp_active" className="text-xs text-slate-300 font-bold cursor-pointer select-none">
+                    គណនីសកម្មភាព (Active Employee Account)
+                  </label>
                 </div>
 
                 {/* Simulated Biomatch scan reference photo setup */}
